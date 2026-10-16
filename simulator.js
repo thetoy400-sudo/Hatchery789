@@ -1,0 +1,2582 @@
+/**
+ * Chick Flow Simulator & Deflector Design Engine
+ * Hệ thống mô phỏng dòng gà con & thiết kế thanh gạt / ระบบจำลองการไหลและออกแบบตัวเกี่ยลูกไก่
+ * 
+ * Physics Model: 2D Particle Discrete Element Method (DEM) on Moving Conveyor Surfaces
+ */
+
+// Global State
+const state = {
+  config: {
+    // Belt 1 (Blue / Infeed)
+    beltBlue: {
+      width: 60,       // cm
+      length: 100,     // cm
+      speed: 15,       // m/min
+      feedRate: 36000, // chicks / hour
+      overlapX: 60,    // cm (position on green belt where blue belt ends)
+      yOffset: 0       // cm (from top of green belt)
+    },
+    // Belt 2 (Green / Distribution)
+    beltGreen: {
+      width: 120,      // cm
+      length: 240,     // cm
+      speed: 15        // m/min
+    },
+    // Chick Particle
+    chick: {
+      diameter: 4.5,   // cm
+      restitution: 0.15, // bounciness (soft bodies)
+      frictionBelt: 8.0  // belt friction coupling strength
+    },
+    // Lane Dividers
+    lanes: {
+      count: 6,
+      length: 80,      // cm
+      widths: [20, 20, 20, 20, 20, 20], // cm (must sum to beltGreen.width)
+      wedgeBase: 6.0,  // cm
+      wedgeHeight: 12.0, // cm
+      minGapMultiplier: 1.3 // min clearance multiplier (k * diameter)
+    },
+    // Obstacles on Green Belt
+    obstacles: []
+  },
+
+  // View state
+  viewMode: 'sim', // 'sim' | 'cad'
+  cadOptions: {
+    showCoords: true,
+    showDist: true,
+    showLabels: true,
+    focusSelected: false
+  },
+  zoom: 1.0,
+  panX: 0,
+  panY: 0,
+  isPanning: false,
+  startPanX: 0,
+  startPanY: 0,
+
+  // Selected obstacle for edit/drag
+  selectedObsId: null,
+  dragTarget: null, // { id, mode: 'move'|'rotate', startX, startY, origX, origY, origAngle }
+
+  // Simulation execution
+  sim: {
+    running: true,
+    speedMultiplier: 1, // 1, 2, 5, 10
+    time: 0,
+    spawnTimer: 0,
+    uiUpdateTimer: 0,
+    chicks: [], // active chick objects
+    stats: {
+      totalSpawned: 0,
+      totalSorted: 0,
+      laneCounts: [0, 0, 0, 0, 0, 0],
+      cv: 0,
+      mean: 0,
+      sd: 0
+    },
+    nextChickId: 1
+  },
+
+  // Spatial Partition Grid for Chick-Chick collisions
+  grid: {
+    cellSize: 10, // cm
+    cells: new Map()
+  },
+
+  // Jamming warnings
+  jammingRisks: []
+};
+
+// Canvas references
+let canvas, ctx;
+let lastTimestamp = 0;
+
+// Presets Definition
+const PRESETS = {
+  none: {
+    name: "1. ไม่มีตัวเกี่ย (เดิม - ไก่กองซ้าย)",
+    desc: "ไม่มีสิ่งกีดขวาง ไก่จะตกกองอยู่ฝั่งซ้ายของสายพานสีเขียว ทำให้เข้าเฉพาะช่อง 1-3 และมีค่า CV สูง (>50%)",
+    obstacles: []
+  },
+  singleAngled: {
+    name: "2. แผ่นเกี่ยเฉียงเดี่ยว (Diagonal Baffle)",
+    desc: "แผ่นเกี่ยเฉียงช่วยดันลูกไก่จากฝั่งซ้ายให้ไหลกระจายไปทางขวา",
+    obstacles: [
+      { id: 'obs-1', type: 'rectangle', name: 'แผ่นเกี่ยเฉียง', x: 50, y: 55, width: 70, height: 4, angle: 32 }
+    ]
+  },
+  staggered: {
+    name: "3. แผ่นเกี่ยสลับ 3 ตอน (Staggered Vanes)",
+    desc: "แผ่นเกี่ย 3 ชิ้นทำมุมสลับกัน เพื่อแบ่งและเกลี่ยลูกไก่ให้เต็มหน้ากว้างสายพาน",
+    obstacles: [
+      { id: 'obs-1', type: 'rectangle', name: 'แผ่นเกี่ยบนซ้าย', x: 42, y: 45, width: 55, height: 4, angle: 28 },
+      { id: 'obs-2', type: 'rectangle', name: 'แผ่นเกี่ยกลางขวา', x: 82, y: 95, width: 52, height: 4, angle: -26 },
+      { id: 'obs-3', type: 'triangle', name: 'ลิ่มกระจายล่าง', x: 60, y: 135, width: 32, height: 25, angle: 0 }
+    ]
+  },
+  pinArray: {
+    name: "4. เสากลมกระจายตัว (Pegboard Array)",
+    desc: "ชุดเสากลมสลับฟันปลาคล้าย Galton Board ช่วยกระจายไก่แบบเกาส์เซียนให้เต็มหน้ากว้าง",
+    obstacles: [
+      { id: 'obs-1', type: 'circle', name: 'เสา 1', x: 30, y: 48, radius: 4.5, angle: 0 },
+      { id: 'obs-2', type: 'circle', name: 'เสา 2', x: 55, y: 48, radius: 4.5, angle: 0 },
+      { id: 'obs-3', type: 'circle', name: 'เสา 3', x: 42.5, y: 78, radius: 4.5, angle: 0 },
+      { id: 'obs-4', type: 'circle', name: 'เสา 4', x: 70, y: 78, radius: 4.5, angle: 0 },
+      { id: 'obs-5', type: 'circle', name: 'เสา 5', x: 30, y: 108, radius: 4.5, angle: 0 },
+      { id: 'obs-6', type: 'circle', name: 'เสา 6', x: 55, y: 108, radius: 4.5, angle: 0 },
+      { id: 'obs-7', type: 'circle', name: 'เสา 7', x: 80, y: 108, radius: 4.5, angle: 0 }
+    ]
+  },
+  dualWedge: {
+    name: "5. ลิ่มแยกทางคู่ (Dual Wedge Splitters)",
+    desc: "หัวลิ่มสามเหลี่ยม 2 ชั้นช่วยแยกกระแสลูกไก่ออกเป็น 4 สายย่อยอย่างสมดุล",
+    obstacles: [
+      { id: 'obs-1', type: 'triangle', name: 'ลิ่มชั้นบน', x: 42, y: 52, width: 36, height: 30, angle: 0 },
+      { id: 'obs-2', type: 'triangle', name: 'ลิ่มซ้ายล่าง', x: 30, y: 115, width: 26, height: 22, angle: 0 },
+      { id: 'obs-3', type: 'triangle', name: 'ลิ่มขวาล่าง', x: 80, y: 115, width: 26, height: 22, angle: 0 }
+    ]
+  }
+};
+
+// Initialize Application
+function initApp() {
+  canvas = document.getElementById('simCanvas');
+  ctx = canvas.getContext('2d');
+
+  // Load default preset
+  loadPreset('staggered');
+
+  // Resize canvas
+  window.addEventListener('resize', resizeCanvas);
+  resizeCanvas();
+
+  // Setup UI Listeners
+  setupEventListeners();
+
+  // Initial UI refresh
+  updateStatsUI();
+  updateCadSpecsTable();
+  renderDbRecordsList();
+
+  // Start animation loop
+  requestAnimationFrame(loop);
+}
+
+// Resize canvas to fill viewport
+function resizeCanvas() {
+  const container = document.getElementById('canvasWrapper');
+  canvas.width = container.clientWidth;
+  canvas.height = container.clientHeight;
+  autoCenterView();
+}
+
+// Center conveyor in view
+function autoCenterView() {
+  const bg = state.config.beltGreen;
+  const bb = state.config.beltBlue;
+  
+  // Total world bounds
+  const blueOffset = bb.length - bb.overlapX;
+  const totalWorldWidth = bg.width + blueOffset + 60;
+  const totalWorldHeight = bg.length + 60;
+
+  const scaleX = (canvas.width * 0.82) / totalWorldWidth;
+  const scaleY = (canvas.height * 0.85) / totalWorldHeight;
+  state.zoom = Math.min(scaleX, scaleY, 2.8);
+
+  const centerX = (canvas.width / 2) - ((bg.width / 2 - blueOffset / 2) * state.zoom);
+  const centerY = (canvas.height / 2) - ((bg.length / 2) * state.zoom);
+
+  state.panX = centerX;
+  state.panY = centerY;
+}
+
+// Coordinate conversions
+function worldToCanvas(wx, wy) {
+  return {
+    x: state.panX + wx * state.zoom,
+    y: state.panY + wy * state.zoom
+  };
+}
+
+function canvasToWorld(cx, cy) {
+  return {
+    x: (cx - state.panX) / state.zoom,
+    y: (cy - state.panY) / state.zoom
+  };
+}
+
+// Load Preset
+function loadPreset(key) {
+  const p = PRESETS[key];
+  if (!p) return;
+  state.config.obstacles = JSON.parse(JSON.stringify(p.obstacles));
+  state.selectedObsId = null;
+  resetStats();
+  updateObstacleListUI();
+  checkJammingRisks();
+  updateCadSpecsTable();
+}
+
+// Reset Simulation Stats
+function resetStats() {
+  state.sim.chicks = [];
+  state.sim.stats = {
+    totalSpawned: 0,
+    totalSorted: 0,
+    laneCounts: new Array(state.config.lanes.count).fill(0),
+    cv: 0,
+    mean: 0,
+    sd: 0
+  };
+  updateStatsUI();
+}
+
+// Calculate CV and Statistics
+function updateStatsCalculations() {
+  const counts = state.sim.stats.laneCounts;
+  const n = counts.length;
+  const total = counts.reduce((a, b) => a + b, 0);
+  state.sim.stats.totalSorted = total;
+
+  if (total === 0) {
+    state.sim.stats.mean = 0;
+    state.sim.stats.sd = 0;
+    state.sim.stats.cv = 0;
+    return;
+  }
+
+  const mean = total / n;
+  let variance = 0;
+  for (let i = 0; i < n; i++) {
+    variance += Math.pow(counts[i] - mean, 2);
+  }
+  variance = variance / (n > 1 ? n - 1 : 1); // Sample variance
+  const sd = Math.sqrt(variance);
+  const cv = mean > 0 ? (sd / mean) * 100 : 0;
+
+  state.sim.stats.mean = mean;
+  state.sim.stats.sd = sd;
+  state.sim.stats.cv = cv;
+}
+
+// Physics Loop
+function loop(timestamp) {
+  if (!lastTimestamp) lastTimestamp = timestamp;
+  let dt = (timestamp - lastTimestamp) / 1000;
+  lastTimestamp = timestamp;
+
+  // Cap dt to avoid huge steps
+  if (dt > 0.1) dt = 0.1;
+
+  if (state.sim.running) {
+    const substeps = 4; // Physics substeps for precision & stability
+    const effectiveDt = (dt * state.sim.speedMultiplier) / substeps;
+    for (let s = 0; s < substeps; s++) {
+      updatePhysics(effectiveDt);
+    }
+    updateStatsCalculations();
+
+    // Throttle UI stat updates for optimal 60fps rendering
+    state.sim.uiUpdateTimer += dt;
+    if (state.sim.uiUpdateTimer >= 0.08) {
+      state.sim.uiUpdateTimer = 0;
+      updateStatsUI();
+    }
+  }
+
+  // Render view
+  render();
+
+  requestAnimationFrame(loop);
+}
+
+// Physics Update
+function updatePhysics(dt) {
+  const { beltBlue, beltGreen, chick: chickCfg, lanes } = state.config;
+  const chickRadius = chickCfg.diameter / 2;
+
+  // Belt speeds: convert m/min to cm/s
+  const vBlue = (beltBlue.speed * 100) / 60;   // cm/s in +X direction
+  const vGreen = (beltGreen.speed * 100) / 60; // cm/s in +Y direction
+
+  // Chick Spawning on Blue Belt
+  const spawnRate = beltBlue.feedRate / 3600; // chicks/sec
+  state.sim.spawnTimer += dt;
+  const spawnInterval = 1 / Math.max(0.1, spawnRate);
+
+  while (state.sim.spawnTimer >= spawnInterval) {
+    state.sim.spawnTimer -= spawnInterval;
+
+    // Spawn chick at entrance of blue belt (leftmost end)
+    const blueStartX = beltBlue.overlapX - beltBlue.length;
+    const spawnX = blueStartX + (Math.random() * 4);
+    const minY = beltBlue.yOffset + chickRadius + 1;
+    const maxY = beltBlue.yOffset + beltBlue.width - chickRadius - 1;
+    const spawnY = minY + Math.random() * (maxY - minY);
+
+    state.sim.chicks.push({
+      id: state.sim.nextChickId++,
+      x: spawnX,
+      y: spawnY,
+      vx: vBlue,
+      vy: 0,
+      radius: chickRadius,
+      belt: 'blue'
+    });
+    state.sim.stats.totalSpawned++;
+  }
+
+  // Update Chicks
+  const chicks = state.sim.chicks;
+  const aliveChicks = [];
+
+  // Update partition grid for collisions
+  state.grid.cells.clear();
+  const cellSize = chickCfg.diameter * 1.5;
+
+  for (let i = 0; i < chicks.length; i++) {
+    const c = chicks[i];
+
+    // Determine current belt surface
+    if (c.belt === 'blue') {
+      // Drag velocity towards (vBlue, 0)
+      c.vx += (vBlue - c.vx) * Math.min(1, dt * chickCfg.frictionBelt);
+      c.vy += (0 - c.vy) * Math.min(1, dt * chickCfg.frictionBelt);
+
+      // Check if chick reached drop roller (end of blue belt over green belt)
+      if (c.x >= beltBlue.overlapX) {
+        c.belt = 'green'; // Drop onto green belt!
+      }
+    } else {
+      // On Green belt: moving downwards
+      // Friction pulls velocity towards (0, vGreen)
+      c.vx += (0 - c.vx) * Math.min(1, dt * chickCfg.frictionBelt);
+      c.vy += (vGreen - c.vy) * Math.min(1, dt * chickCfg.frictionBelt);
+    }
+
+    // Integrate position
+    c.x += c.vx * dt;
+    c.y += c.vy * dt;
+
+    // Boundary constraints: Blue belt outer walls
+    if (c.belt === 'blue') {
+      const topLimit = beltBlue.yOffset + c.radius;
+      const bottomLimit = beltBlue.yOffset + beltBlue.width - c.radius;
+      if (c.y < topLimit) { c.y = topLimit; c.vy = 0; }
+      if (c.y > bottomLimit) { c.y = bottomLimit; c.vy = 0; }
+    }
+
+    // Boundary constraints: Green belt walls & obstacles
+    if (c.belt === 'green') {
+      if (c.x < c.radius) {
+        c.x = c.radius;
+        c.vx = Math.abs(c.vx) * 0.1;
+      }
+      if (c.x > beltGreen.width - c.radius) {
+        c.x = beltGreen.width - c.radius;
+        c.vx = -Math.abs(c.vx) * 0.1;
+      }
+      if (c.y < c.radius) {
+        c.y = c.radius;
+        c.vy = Math.max(0, c.vy);
+      }
+
+      // Obstacle collisions
+      for (let j = 0; j < state.config.obstacles.length; j++) {
+        resolveObstacleCollision(c, state.config.obstacles[j]);
+      }
+
+      // Lane dividers collisions
+      resolveLaneDividersCollision(c);
+    }
+
+    // Check if chick reached bottom exit of Green belt
+    if (c.belt === 'green' && c.y >= beltGreen.length) {
+      const laneIndex = getLaneIndexAtX(c.x);
+      if (laneIndex >= 0 && laneIndex < state.config.lanes.count) {
+        state.sim.stats.laneCounts[laneIndex]++;
+      }
+      continue; // Chick leaves conveyor
+    }
+
+    // Insert into spatial grid
+    const cellKey = `${Math.floor(c.x / cellSize)},${Math.floor(c.y / cellSize)}`;
+    if (!state.grid.cells.has(cellKey)) {
+      state.grid.cells.set(cellKey, []);
+    }
+    state.grid.cells.get(cellKey).push(c);
+
+    aliveChicks.push(c);
+  }
+
+  // Chick - Chick Collisions using spatial grid
+  for (const [key, cellChicks] of state.grid.cells.entries()) {
+    const [cx, cy] = key.split(',').map(Number);
+    for (let dx = 0; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        if (dx === 0 && dy < 0) continue;
+        const nKey = `${cx + dx},${cy + dy}`;
+        const neighborChicks = state.grid.cells.get(nKey);
+        if (!neighborChicks) continue;
+
+        const isSameCell = (dx === 0 && dy === 0);
+        for (let i = 0; i < cellChicks.length; i++) {
+          const startJ = isSameCell ? i + 1 : 0;
+          for (let j = startJ; j < neighborChicks.length; j++) {
+            resolveChickCollision(cellChicks[i], neighborChicks[j]);
+          }
+        }
+      }
+    }
+  }
+
+  state.sim.chicks = aliveChicks;
+}
+
+// Chick - Chick Collision Resolution
+function resolveChickCollision(c1, c2) {
+  const dx = c2.x - c1.x;
+  const dy = c2.y - c1.y;
+  const distSq = dx * dx + dy * dy;
+  const minDist = c1.radius + c2.radius;
+
+  if (distSq < minDist * minDist && distSq > 0.00001) {
+    const dist = Math.sqrt(distSq);
+    const overlap = minDist - dist;
+    const nx = dx / dist;
+    const ny = dy / dist;
+
+    // Positional separation (50% each)
+    c1.x -= nx * overlap * 0.5;
+    c1.y -= ny * overlap * 0.5;
+    c2.x += nx * overlap * 0.5;
+    c2.y += ny * overlap * 0.5;
+
+    // Velocity exchange with damping
+    const relVx = c1.vx - c2.vx;
+    const relVy = c1.vy - c2.vy;
+    const vn = relVx * nx + relVy * ny;
+
+    if (vn > 0) {
+      const e = state.config.chick.restitution;
+      const impulse = (-(1 + e) * vn) / 2;
+      c1.vx += impulse * nx;
+      c1.vy += impulse * ny;
+      c2.vx -= impulse * nx;
+      c2.vy -= impulse * ny;
+    }
+  }
+}
+
+// Obstacle Collision Resolution
+function resolveObstacleCollision(chick, obs) {
+  if (obs.type === 'circle') {
+    const dx = chick.x - obs.x;
+    const dy = chick.y - obs.y;
+    const distSq = dx * dx + dy * dy;
+    const minDist = obs.radius + chick.radius;
+
+    if (distSq < minDist * minDist && distSq > 0.0001) {
+      const dist = Math.sqrt(distSq);
+      const nx = dx / dist;
+      const ny = dy / dist;
+      const overlap = minDist - dist;
+
+      chick.x += nx * overlap;
+      chick.y += ny * overlap;
+
+      const vn = chick.vx * nx + chick.vy * ny;
+      if (vn < 0) {
+        chick.vx -= (1 + state.config.chick.restitution) * vn * nx;
+        chick.vy -= (1 + state.config.chick.restitution) * vn * ny;
+      }
+    }
+  } else if (obs.type === 'rectangle') {
+    const rad = (-obs.angle * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+
+    const relX = chick.x - obs.x;
+    const relY = chick.y - obs.y;
+    const localX = cos * relX - sin * relY;
+    const localY = sin * relX + cos * relY;
+
+    const halfW = obs.width / 2;
+    const halfH = obs.height / 2;
+
+    const clampedX = Math.max(-halfW, Math.min(halfW, localX));
+    const clampedY = Math.max(-halfH, Math.min(halfH, localY));
+
+    const diffX = localX - clampedX;
+    const diffY = localY - clampedY;
+    const distSq = diffX * diffX + diffY * diffY;
+
+    if (distSq < chick.radius * chick.radius) {
+      let nxLocal = 0, nyLocal = 0;
+      let overlap = 0;
+
+      if (distSq > 0.00001) {
+        const dist = Math.sqrt(distSq);
+        nxLocal = diffX / dist;
+        nyLocal = diffY / dist;
+        overlap = chick.radius - dist;
+      } else {
+        const distToEdgeX = halfW - Math.abs(localX);
+        const distToEdgeY = halfH - Math.abs(localY);
+        if (distToEdgeX < distToEdgeY) {
+          nxLocal = localX >= 0 ? 1 : -1;
+          nyLocal = 0;
+          overlap = distToEdgeX + chick.radius;
+        } else {
+          nxLocal = 0;
+          nyLocal = localY >= 0 ? 1 : -1;
+          overlap = distToEdgeY + chick.radius;
+        }
+      }
+
+      const worldCos = Math.cos(-rad);
+      const worldSin = Math.sin(-rad);
+      const nxWorld = worldCos * nxLocal - worldSin * nyLocal;
+      const nyWorld = worldSin * nxLocal + worldCos * nyLocal;
+
+      chick.x += nxWorld * overlap;
+      chick.y += nyWorld * overlap;
+
+      const vn = chick.vx * nxWorld + chick.vy * nyWorld;
+      if (vn < 0) {
+        chick.vx -= (1 + state.config.chick.restitution) * vn * nxWorld;
+        chick.vy -= (1 + state.config.chick.restitution) * vn * nyWorld;
+      }
+    }
+  } else if (obs.type === 'triangle') {
+    const rad = (obs.angle * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+
+    const h = obs.height;
+    const b = obs.width;
+    const localApex = { x: 0, y: -h * 0.6 };
+    const localLeft = { x: -b / 2, y: h * 0.4 };
+    const localRight = { x: b / 2, y: h * 0.4 };
+
+    const rotatePoint = (p) => ({
+      x: obs.x + (cos * p.x - sin * p.y),
+      y: obs.y + (sin * p.x + cos * p.y)
+    });
+
+    const v1 = rotatePoint(localApex);
+    const v2 = rotatePoint(localLeft);
+    const v3 = rotatePoint(localRight);
+
+    resolveCirclePolygonCollision(chick, [v1, v2, v3]);
+  }
+}
+
+// Collide circle with 2D convex polygon
+function resolveCirclePolygonCollision(chick, vertices) {
+  let minDist = Infinity;
+  let closestNormal = { x: 0, y: 0 };
+  let inside = true;
+
+  for (let i = 0; i < vertices.length; i++) {
+    const p1 = vertices[i];
+    const p2 = vertices[(i + 1) % vertices.length];
+
+    const segX = p2.x - p1.x;
+    const segY = p2.y - p1.y;
+    const segLenSq = segX * segX + segY * segY;
+
+    let t = ((chick.x - p1.x) * segX + (chick.y - p1.y) * segY) / segLenSq;
+    t = Math.max(0, Math.min(1, t));
+
+    const projX = p1.x + t * segX;
+    const projY = p1.y + t * segY;
+
+    const diffX = chick.x - projX;
+    const diffY = chick.y - projY;
+    const distSq = diffX * diffX + diffY * diffY;
+
+    const edgeNormX = -segY;
+    const edgeNormY = segX;
+    const dot = (chick.x - p1.x) * edgeNormX + (chick.y - p1.y) * edgeNormY;
+    if (dot < 0) {
+      inside = false;
+    }
+
+    if (distSq < minDist) {
+      minDist = distSq;
+      const d = Math.sqrt(distSq);
+      if (d > 0.0001) {
+        closestNormal = { x: diffX / d, y: diffY / d };
+      }
+    }
+  }
+
+  const d = Math.sqrt(minDist);
+  if (d < chick.radius || inside) {
+    const overlap = chick.radius - d;
+    chick.x += closestNormal.x * overlap;
+    chick.y += closestNormal.y * overlap;
+
+    const vn = chick.vx * closestNormal.x + chick.vy * closestNormal.y;
+    if (vn < 0) {
+      chick.vx -= (1 + state.config.chick.restitution) * vn * closestNormal.x;
+      chick.vy -= (1 + state.config.chick.restitution) * vn * closestNormal.y;
+    }
+  }
+}
+
+// Lane Dividers & Triangles Collision Resolution
+function resolveLaneDividersCollision(chick) {
+  const { beltGreen, lanes } = state.config;
+  const laneStartY = beltGreen.length - lanes.length;
+
+  if (chick.y < laneStartY - lanes.wedgeHeight - 5) return;
+
+  let currentX = 0;
+  const divXList = [];
+  for (let i = 0; i < lanes.widths.length - 1; i++) {
+    currentX += lanes.widths[i];
+    divXList.push(currentX);
+  }
+
+  const halfBase = lanes.wedgeBase / 2;
+  const wedgeH = lanes.wedgeHeight;
+
+  for (let i = 0; i < divXList.length; i++) {
+    const divX = divXList[i];
+    const apex = { x: divX, y: laneStartY - wedgeH };
+    const baseL = { x: divX - halfBase, y: laneStartY };
+    const baseR = { x: divX + halfBase, y: laneStartY };
+
+    resolveCirclePolygonCollision(chick, [apex, baseL, baseR]);
+
+    if (chick.y >= laneStartY) {
+      const wallDist = Math.abs(chick.x - divX);
+      if (wallDist < chick.radius + 0.3) {
+        const side = chick.x < divX ? -1 : 1;
+        chick.x = divX + side * (chick.radius + 0.3);
+        chick.vx = 0;
+      }
+    }
+  }
+}
+
+// Find lane index for given X coordinate
+function getLaneIndexAtX(x) {
+  const { widths } = state.config.lanes;
+  let accumulated = 0;
+  for (let i = 0; i < widths.length; i++) {
+    accumulated += widths[i];
+    if (x <= accumulated) return i;
+  }
+  return widths.length - 1;
+}
+
+// Check Jamming Risks & Bottlenecks
+function checkJammingRisks() {
+  const { beltGreen, lanes, chick } = state.config;
+  const minClearanceReq = chick.diameter * lanes.minGapMultiplier;
+  const risks = [];
+
+  const obsList = state.config.obstacles;
+
+  // 1. Obstacle to Belt Walls (Left X=0, Right X=W)
+  for (let i = 0; i < obsList.length; i++) {
+    const obs = obsList[i];
+    const halfSpan = obs.type === 'circle' ? obs.radius : (obs.width / 2);
+
+    const leftDist = obs.x - halfSpan;
+    if (leftDist < minClearanceReq) {
+      risks.push({
+        id: `wall-left-${obs.id}`,
+        title: `ช่องแคบ: ${obs.name} กับ ขอบซ้ายสายพาน`,
+        dist: leftDist,
+        p1: { x: 0, y: obs.y },
+        p2: { x: obs.x - halfSpan, y: obs.y }
+      });
+    }
+
+    const rightDist = beltGreen.width - (obs.x + halfSpan);
+    if (rightDist < minClearanceReq) {
+      risks.push({
+        id: `wall-right-${obs.id}`,
+        title: `ช่องแคบ: ${obs.name} กับ ขอบขวาสายพาน`,
+        dist: rightDist,
+        p1: { x: obs.x + halfSpan, y: obs.y },
+        p2: { x: beltGreen.width, y: obs.y }
+      });
+    }
+  }
+
+  // 2. Distance between Obstacles
+  for (let i = 0; i < obsList.length; i++) {
+    for (let j = i + 1; j < obsList.length; j++) {
+      const o1 = obsList[i];
+      const o2 = obsList[j];
+      const dx = o2.x - o1.x;
+      const dy = o2.y - o1.y;
+      const centerDist = Math.sqrt(dx * dx + dy * dy);
+
+      const r1 = o1.type === 'circle' ? o1.radius : (Math.min(o1.width, o1.height) / 2);
+      const r2 = o2.type === 'circle' ? o2.radius : (Math.min(o2.width, o2.height) / 2);
+      const approxGap = centerDist - (r1 + r2);
+
+      if (approxGap < minClearanceReq) {
+        risks.push({
+          id: `obs-${o1.id}-${o2.id}`,
+          title: `ช่องแคบ: ${o1.name} กับ ${o2.name}`,
+          dist: approxGap,
+          p1: { x: o1.x, y: o1.y },
+          p2: { x: o2.x, y: o2.y }
+        });
+      }
+    }
+  }
+
+  state.jammingRisks = risks;
+  updateJammingWarningsUI();
+}
+
+// Instant Fast Batch Simulation
+function runBatchSimulation(targetCount = 1000) {
+  const prevRunning = state.sim.running;
+  state.sim.running = false;
+  resetStats();
+
+  const { beltBlue, beltGreen, chick: chickCfg } = state.config;
+  const chickRadius = chickCfg.diameter / 2;
+  const vGreen = (beltGreen.speed * 100) / 60;
+  const dt = 0.016;
+
+  const btn = document.getElementById('btnBatch');
+  if (btn) btn.innerHTML = `⏳ กำลังจำลอง ${targetCount} ตัว...`;
+
+  setTimeout(() => {
+    let sortedCount = 0;
+    const batchChicks = [];
+
+    // Pre-spawn chicks with realistic drop dispersion from blue belt
+    for (let i = 0; i < targetCount; i++) {
+      const dropMinX = chickRadius + 1;
+      const dropMaxX = beltBlue.overlapX - chickRadius - 1;
+      const x = dropMinX + Math.random() * (dropMaxX - dropMinX);
+      const y = beltBlue.yOffset + Math.random() * beltBlue.width - (i * 3.5);
+
+      batchChicks.push({
+        x: x,
+        y: y,
+        vx: (Math.random() - 0.5) * 5,
+        vy: vGreen,
+        radius: chickRadius
+      });
+    }
+
+    let maxSteps = 15000;
+    let step = 0;
+
+    while (sortedCount < targetCount && step < maxSteps) {
+      step++;
+      for (let i = 0; i < batchChicks.length; i++) {
+        const c = batchChicks[i];
+        if (c.sorted) continue;
+
+        c.vx += (0 - c.vx) * Math.min(1, dt * chickCfg.frictionBelt);
+        c.vy += (vGreen - c.vy) * Math.min(1, dt * chickCfg.frictionBelt);
+        c.x += c.vx * dt;
+        c.y += c.vy * dt;
+
+        if (c.x < c.radius) { c.x = c.radius; c.vx = 0; }
+        if (c.x > beltGreen.width - c.radius) { c.x = beltGreen.width - c.radius; c.vx = 0; }
+
+        for (let j = 0; j < state.config.obstacles.length; j++) {
+          resolveObstacleCollision(c, state.config.obstacles[j]);
+        }
+        resolveLaneDividersCollision(c);
+
+        if (c.y >= beltGreen.length) {
+          c.sorted = true;
+          sortedCount++;
+          const laneIdx = getLaneIndexAtX(c.x);
+          if (laneIdx >= 0 && laneIdx < state.config.lanes.count) {
+            state.sim.stats.laneCounts[laneIdx]++;
+          }
+        }
+      }
+    }
+
+    state.sim.stats.totalSpawned = targetCount;
+    state.sim.stats.totalSorted = sortedCount;
+    updateStatsCalculations();
+    updateStatsUI();
+
+    if (btn) btn.innerHTML = `⚡ จำลองด่วน 1,000 ตัว`;
+    state.sim.running = prevRunning;
+  }, 50);
+}
+
+// -------------------------------------------------------------
+// Rendering: Simulation View & CAD Blueprint View
+// -------------------------------------------------------------
+
+function render() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (state.viewMode === 'sim') {
+    renderSimulationView();
+  } else {
+    renderCADBlueprintView();
+  }
+}
+
+// Render Simulation View
+function renderSimulationView() {
+  const { beltBlue, beltGreen, lanes } = state.config;
+
+  ctx.save();
+  drawGrid(30, '#1e293b');
+
+  ctx.translate(state.panX, state.panY);
+  ctx.scale(state.zoom, state.zoom);
+
+  // 1. Draw Green Belt (Distribution Belt)
+  ctx.fillStyle = '#14532d';
+  ctx.fillRect(0, 0, beltGreen.width, beltGreen.length);
+  ctx.strokeStyle = '#22c55e';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(0, 0, beltGreen.width, beltGreen.length);
+
+  // Direction arrows on Green Belt
+  drawConveyorArrow(beltGreen.width / 2, beltGreen.length * 0.42, 0, 1, 40, '#15803d', '#4ade80');
+
+  // 2. Draw Blue Belt (Infeed Belt)
+  const blueX = beltBlue.overlapX - beltBlue.length;
+  const blueY = beltBlue.yOffset;
+  ctx.fillStyle = '#1d4ed8';
+  ctx.fillRect(blueX, blueY, beltBlue.length, beltBlue.width);
+  ctx.strokeStyle = '#60a5fa';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(blueX, blueY, beltBlue.length, beltBlue.width);
+
+  // Blue Belt Direction Arrow
+  drawConveyorArrow(blueX + beltBlue.length * 0.45, blueY + beltBlue.width / 2, 1, 0, 35, '#1e40af', '#93c5fd');
+
+  // Drop Roller line (edge of blue belt)
+  ctx.beginPath();
+  ctx.moveTo(beltBlue.overlapX, blueY);
+  ctx.lineTo(beltBlue.overlapX, blueY + beltBlue.width);
+  ctx.strokeStyle = '#facc15';
+  ctx.lineWidth = 2.5;
+  ctx.setLineDash([4, 4]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // 3. Draw Lane Dividers & Triangular Wedges
+  const laneStartY = beltGreen.length - lanes.length;
+  let accX = 0;
+  const divXList = [];
+  for (let i = 0; i < lanes.widths.length - 1; i++) {
+    accX += lanes.widths[i];
+    divXList.push(accX);
+  }
+
+  // Draw lanes background highlighting & labels
+  let laneLeftX = 0;
+  for (let i = 0; i < lanes.widths.length; i++) {
+    const w = lanes.widths[i];
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+    ctx.font = 'bold 9px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(`ช่อง ${i + 1}`, laneLeftX + w / 2, beltGreen.length - 10);
+    laneLeftX += w;
+  }
+
+  // Divider walls & wedges
+  const halfBase = lanes.wedgeBase / 2;
+  const wedgeH = lanes.wedgeHeight;
+
+  for (let i = 0; i < divXList.length; i++) {
+    const x = divXList[i];
+
+    ctx.beginPath();
+    ctx.moveTo(x, laneStartY);
+    ctx.lineTo(x, beltGreen.length);
+    ctx.strokeStyle = '#eab308';
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(x, laneStartY - wedgeH);
+    ctx.lineTo(x - halfBase, laneStartY);
+    ctx.lineTo(x + halfBase, laneStartY);
+    ctx.closePath();
+    ctx.fillStyle = '#eab308';
+    ctx.fill();
+    ctx.strokeStyle = '#ca8a04';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
+  // 4. Draw Obstacles (สิ่งกีดขวาง / ตัวเกี่ยไก่)
+  for (let i = 0; i < state.config.obstacles.length; i++) {
+    const obs = state.config.obstacles[i];
+    const isSelected = (obs.id === state.selectedObsId);
+    drawObstacle(obs, isSelected, false);
+  }
+
+  // 5. Draw Jamming Warning lines
+  if (state.jammingRisks.length > 0) {
+    for (let i = 0; i < state.jammingRisks.length; i++) {
+      const risk = state.jammingRisks[i];
+      ctx.beginPath();
+      ctx.moveTo(risk.p1.x, risk.p1.y);
+      ctx.lineTo(risk.p2.x, risk.p2.y);
+      ctx.strokeStyle = '#ef4444';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([3, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      const midX = (risk.p1.x + risk.p2.x) / 2;
+      const midY = (risk.p1.y + risk.p2.y) / 2;
+      ctx.fillStyle = '#dc2626';
+      ctx.font = 'bold 8px sans-serif';
+      ctx.fillText(`⚠️ ${risk.dist.toFixed(1)} cm`, midX, midY - 3);
+    }
+  }
+
+  // 6. Draw Chicks (Particles)
+  const chicks = state.sim.chicks;
+  for (let i = 0; i < chicks.length; i++) {
+    const c = chicks[i];
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, c.radius, 0, Math.PI * 2);
+    ctx.fillStyle = '#fde047';
+    ctx.fill();
+    ctx.strokeStyle = '#ca8a04';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    const eyeAngle = Math.atan2(c.vy, c.vx);
+    const eyeDist = c.radius * 0.45;
+    const eyeX = c.x + Math.cos(eyeAngle) * eyeDist;
+    const eyeY = c.y + Math.sin(eyeAngle) * eyeDist;
+    ctx.beginPath();
+    ctx.arc(eyeX, eyeY, 1, 0, Math.PI * 2);
+    ctx.fillStyle = '#78350f';
+    ctx.fill();
+  }
+
+  ctx.restore();
+}
+
+// Spatial collision tracker for CAD text badges & cards
+class BadgeLayoutManager {
+  constructor() {
+    this.boxes = [];
+  }
+
+  addBox(x, y, w, h) {
+    this.boxes.push({ x, y, w, h });
+  }
+
+  isColliding(box) {
+    for (let i = 0; i < this.boxes.length; i++) {
+      const b = this.boxes[i];
+      if (
+        box.x < b.x + b.w &&
+        box.x + box.w > b.x &&
+        box.y < b.y + b.h &&
+        box.y + box.h > b.y
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  findFreePosition(startX, startY, w, h, step = 14) {
+    const trial = { x: startX, y: startY, w, h };
+    if (!this.isColliding(trial)) {
+      this.boxes.push(trial);
+      return { x: startX, y: startY };
+    }
+
+    const offsets = [
+      { dx: 0, dy: -step },
+      { dx: 0, dy: step },
+      { dx: step * 1.5, dy: 0 },
+      { dx: -step * 1.5, dy: 0 },
+      { dx: 0, dy: -step * 2 },
+      { dx: 0, dy: step * 2 },
+      { dx: step * 2, dy: -step },
+      { dx: -step * 2, dy: step },
+      { dx: step * 2, dy: step },
+      { dx: -step * 2, dy: -step },
+      { dx: 0, dy: -step * 3 },
+      { dx: 0, dy: step * 3 }
+    ];
+
+    for (let i = 0; i < offsets.length; i++) {
+      const test = { x: startX + offsets[i].dx, y: startY + offsets[i].dy, w, h };
+      if (!this.isColliding(test)) {
+        this.boxes.push(test);
+        return { x: test.x, y: test.y };
+      }
+    }
+
+    this.boxes.push({ x: startX, y: startY, w, h });
+    return { x: startX, y: startY };
+  }
+}
+
+// Compute Minimum Spanning Tree (MST) of obstacles for clean inter-distance lines
+function computeObstacleMST(obstacles) {
+  const n = obstacles.length;
+  if (n < 2) return [];
+
+  const inMST = new Array(n).fill(false);
+  const minEdge = new Array(n).fill(Infinity);
+  const parent = new Array(n).fill(-1);
+
+  minEdge[0] = 0;
+  const edges = [];
+
+  for (let count = 0; count < n; count++) {
+    let u = -1;
+    for (let i = 0; i < n; i++) {
+      if (!inMST[i] && (u === -1 || minEdge[i] < minEdge[u])) {
+        u = i;
+      }
+    }
+
+    if (u === -1 || minEdge[u] === Infinity) break;
+    inMST[u] = true;
+
+    if (parent[u] !== -1) {
+      edges.push({
+        o1: obstacles[parent[u]],
+        o2: obstacles[u],
+        dist: minEdge[u]
+      });
+    }
+
+    for (let v = 0; v < n; v++) {
+      if (!inMST[v]) {
+        const dx = obstacles[v].x - obstacles[u].x;
+        const dy = obstacles[v].y - obstacles[u].y;
+        const d = Math.hypot(dx, dy);
+        if (d < minEdge[v]) {
+          minEdge[v] = d;
+          parent[v] = u;
+        }
+      }
+    }
+  }
+
+  return edges;
+}
+
+// Draw rounded rectangle helper
+function drawRoundedRect(ctx, x, y, width, height, radius = 3) {
+  if (ctx.roundRect) {
+    ctx.beginPath();
+    ctx.roundRect(x, y, width, height, radius);
+    return;
+  }
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.lineTo(x + width - radius, y);
+  ctx.arcTo(x + width, y, x + width, y + height, radius);
+  ctx.arcTo(x + width, y + height, x, y + height, radius);
+  ctx.arcTo(x, y + height, x, y, radius);
+  ctx.arcTo(x, y, x + width, y, radius);
+  ctx.closePath();
+}
+
+// Draw dimension badge with solid background
+function drawCADDimensionBadge(ctx, x1, y1, x2, y2, text, options = {}, layoutMgr = null) {
+  const {
+    color = '#38bdf8',
+    bgColor = '#0f172a',
+    borderColor = '#0284c7',
+    textColor = '#f8fafc',
+    fontSize = 8.2,
+    isDashed = false,
+    offsetBadgeY = 0,
+    offsetBadgeX = 0
+  } = options;
+
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1;
+  if (isDashed) {
+    ctx.setLineDash([3, 3]);
+  } else {
+    ctx.setLineDash([]);
+  }
+
+  // Draw main line
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Draw arrowheads
+  const arrowSize = 3;
+  const angle = Math.atan2(y2 - y1, x2 - x1);
+
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x1 + Math.cos(angle + 0.5) * arrowSize, y1 + Math.sin(angle + 0.5) * arrowSize);
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x1 + Math.cos(angle - 0.5) * arrowSize, y1 + Math.sin(angle - 0.5) * arrowSize);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - Math.cos(angle + 0.5) * arrowSize, y2 - Math.sin(angle + 0.5) * arrowSize);
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - Math.cos(angle - 0.5) * arrowSize, y2 - Math.sin(angle - 0.5) * arrowSize);
+  ctx.stroke();
+
+  // Measure text and badge size
+  ctx.font = `bold ${fontSize}px monospace`;
+  const textWidth = ctx.measureText(text).width;
+  const badgeW = textWidth + 8;
+  const badgeH = fontSize + 6;
+
+  let midX = (x1 + x2) / 2 + offsetBadgeX;
+  let midY = (y1 + y2) / 2 + offsetBadgeY;
+
+  let pillX = midX - badgeW / 2;
+  let pillY = midY - badgeH / 2;
+
+  if (layoutMgr) {
+    const free = layoutMgr.findFreePosition(pillX, pillY, badgeW, badgeH, 12);
+    pillX = free.x;
+    pillY = free.y;
+    midX = pillX + badgeW / 2;
+    midY = pillY + badgeH / 2;
+  }
+
+  // Solid background box
+  ctx.fillStyle = bgColor;
+  ctx.strokeStyle = borderColor;
+  ctx.lineWidth = 0.8;
+  drawRoundedRect(ctx, pillX, pillY, badgeW, badgeH, 3);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = textColor;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, midX, midY + 0.5);
+
+  ctx.restore();
+}
+
+// Draw Callout Card for Obstacle (Leader Card with Solid Box)
+function drawObstacleCalloutCard(ctx, obs, index, isSelected, beltWidth, layoutMgr) {
+  const halfSpan = (obs.type === 'circle' ? obs.radius : Math.max(obs.width, obs.height) / 2) + 2;
+
+  const nameLine = `#${index + 1} ${obs.name}`;
+  let specLine = `(X:${obs.x.toFixed(1)}, Y:${obs.y.toFixed(1)})`;
+  if (obs.type === 'rectangle') specLine += ` | ${obs.width}x${obs.height}cm (${obs.angle}°)`;
+  else if (obs.type === 'triangle') specLine += ` | ฐาน${obs.width} สูง${obs.height}cm`;
+  else if (obs.type === 'circle') specLine += ` | R:${obs.radius}cm`;
+
+  ctx.font = 'bold 8.5px "Segoe UI", sans-serif';
+  const w1 = ctx.measureText(nameLine).width;
+  ctx.font = '7.8px monospace';
+  const w2 = ctx.measureText(specLine).width;
+  const cardW = Math.max(w1, w2) + 16;
+  const cardH = 25;
+
+  // Placement based on horizontal position on belt
+  let targetX, targetY;
+  if (obs.x < beltWidth * 0.45) {
+    targetX = obs.x + halfSpan + 8;
+    targetY = obs.y - cardH / 2;
+  } else if (obs.x > beltWidth * 0.55) {
+    targetX = obs.x - halfSpan - 8 - cardW;
+    targetY = obs.y - cardH / 2;
+  } else {
+    targetX = obs.x + halfSpan + 8;
+    targetY = obs.y - cardH / 2;
+  }
+
+  if (targetX < 4) targetX = 4;
+  if (targetX + cardW > beltWidth - 4) targetX = beltWidth - cardW - 4;
+
+  const freePos = layoutMgr.findFreePosition(targetX, targetY, cardW, cardH, cardH + 4);
+  const finalX = freePos.x;
+  const finalY = freePos.y;
+
+  // Leader line
+  ctx.save();
+  ctx.strokeStyle = isSelected ? '#f59e0b' : '#64748b';
+  ctx.lineWidth = isSelected ? 1.5 : 0.9;
+
+  ctx.beginPath();
+  ctx.arc(obs.x, obs.y, 2, 0, Math.PI * 2);
+  ctx.fillStyle = isSelected ? '#f59e0b' : '#38bdf8';
+  ctx.fill();
+
+  const attachX = (finalX > obs.x) ? finalX : finalX + cardW;
+  const attachY = finalY + cardH / 2;
+
+  ctx.beginPath();
+  ctx.moveTo(obs.x, obs.y);
+  ctx.lineTo(attachX, attachY);
+  ctx.stroke();
+
+  // Solid Card Background
+  ctx.fillStyle = isSelected ? 'rgba(30, 41, 59, 0.96)' : 'rgba(15, 23, 42, 0.94)';
+  ctx.strokeStyle = isSelected ? '#f59e0b' : '#334155';
+  ctx.lineWidth = isSelected ? 1.5 : 1;
+  drawRoundedRect(ctx, finalX, finalY, cardW, cardH, 4);
+  ctx.fill();
+  ctx.stroke();
+
+  // Card Text
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+
+  ctx.font = 'bold 8.5px "Segoe UI", sans-serif';
+  ctx.fillStyle = isSelected ? '#f59e0b' : '#38bdf8';
+  ctx.fillText(nameLine, finalX + 8, finalY + 4);
+
+  ctx.font = '7.8px monospace';
+  ctx.fillStyle = '#cbd5e1';
+  ctx.fillText(specLine, finalX + 8, finalY + 14);
+
+  ctx.restore();
+}
+
+// Render CAD Blueprint View (แบบสั่งสร้างทางวิศวกรรม)
+function renderCADBlueprintView() {
+  const { beltBlue, beltGreen, lanes } = state.config;
+  const cadOpts = state.cadOptions || { showCoords: true, showDist: true, showLabels: true, focusSelected: false };
+
+  ctx.save();
+  drawGrid(20, '#1e293b');
+
+  ctx.translate(state.panX, state.panY);
+  ctx.scale(state.zoom, state.zoom);
+
+  const layoutMgr = new BadgeLayoutManager();
+
+  // Outer Conveyor Outlines
+  ctx.strokeStyle = '#38bdf8';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(0, 0, beltGreen.width, beltGreen.length);
+
+  // Belt 1 Outline
+  const blueX = beltBlue.overlapX - beltBlue.length;
+  const blueY = beltBlue.yOffset;
+  ctx.strokeStyle = '#93c5fa';
+  ctx.setLineDash([5, 3]);
+  ctx.strokeRect(blueX, blueY, beltBlue.length, beltBlue.width);
+  ctx.setLineDash([]);
+
+  // Datum Origin (0,0) Marker
+  drawDatumMarker(0, 0, 'DATUM (0,0)');
+
+  // Main Belt Overall Dimensions (outside the conveyor)
+  drawDimensionLine(-14, 0, -14, beltGreen.length, `L = ${beltGreen.length} cm`, 'left');
+  drawDimensionLine(0, -14, beltGreen.width, -14, `W = ${beltGreen.width} cm`, 'top');
+
+  // Blue Belt Infeed Dimension
+  drawDimensionLine(0, -26, beltBlue.overlapX, -26, `Overlap = ${beltBlue.overlapX} cm`, 'top');
+
+  // Lane Dividers & Widths
+  const laneStartY = beltGreen.length - lanes.length;
+  drawDimensionLine(beltGreen.width + 14, laneStartY, beltGreen.width + 14, beltGreen.length, `Lanes = ${lanes.length} cm`, 'right');
+
+  let curX = 0;
+  for (let i = 0; i < lanes.widths.length; i++) {
+    const w = lanes.widths[i];
+    const nextX = curX + w;
+    drawDimensionLine(curX, beltGreen.length + 12, nextX, beltGreen.length + 12, `L${i + 1}:${w}`, 'bottom');
+
+    if (i < lanes.widths.length - 1) {
+      ctx.beginPath();
+      ctx.moveTo(nextX, laneStartY);
+      ctx.lineTo(nextX, beltGreen.length);
+      ctx.strokeStyle = '#eab308';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      const halfBase = lanes.wedgeBase / 2;
+      ctx.beginPath();
+      ctx.moveTo(nextX, laneStartY - lanes.wedgeHeight);
+      ctx.lineTo(nextX - halfBase, laneStartY);
+      ctx.lineTo(nextX + halfBase, laneStartY);
+      ctx.closePath();
+      ctx.strokeStyle = '#eab308';
+      ctx.fillStyle = 'rgba(234, 179, 8, 0.15)';
+      ctx.fill();
+      ctx.stroke();
+    }
+    curX = nextX;
+  }
+
+  // Pre-register obstacle boundaries to avoid text overlapping obstacle shapes
+  for (let i = 0; i < state.config.obstacles.length; i++) {
+    const o = state.config.obstacles[i];
+    const span = (o.type === 'circle' ? o.radius : Math.max(o.width, o.height) / 2) + 3;
+    layoutMgr.addBox(o.x - span, o.y - span, span * 2, span * 2);
+  }
+
+  // 1. Draw Obstacles shapes and circular center index badge
+  for (let i = 0; i < state.config.obstacles.length; i++) {
+    const obs = state.config.obstacles[i];
+    const isSelected = (obs.id === state.selectedObsId);
+    drawObstacle(obs, isSelected, true, i + 1);
+  }
+
+  // 2. Draw Inter-obstacle Distances (Clean Minimum Spanning Tree connections)
+  if (cadOpts.showDist && state.config.obstacles.length > 1) {
+    const mstEdges = computeObstacleMST(state.config.obstacles);
+    for (let i = 0; i < mstEdges.length; i++) {
+      const edge = mstEdges[i];
+      drawCADDimensionBadge(
+        ctx,
+        edge.o1.x, edge.o1.y,
+        edge.o2.x, edge.o2.y,
+        `${edge.dist.toFixed(1)} cm`,
+        {
+          color: '#64748b',
+          borderColor: '#475569',
+          textColor: '#cbd5e1',
+          fontSize: 7.8,
+          isDashed: true
+        },
+        layoutMgr
+      );
+    }
+  }
+
+  // 3. Draw Datum Coordinates Lines (X from left datum, Y from top datum)
+  if (cadOpts.showCoords) {
+    for (let i = 0; i < state.config.obstacles.length; i++) {
+      const obs = state.config.obstacles[i];
+      const isSelected = (obs.id === state.selectedObsId);
+
+      if (cadOpts.focusSelected && !isSelected) continue;
+
+      const lineColor = isSelected ? '#38bdf8' : 'rgba(56, 189, 248, 0.45)';
+      const borderColor = isSelected ? '#38bdf8' : '#0369a1';
+      const textColor = isSelected ? '#ffffff' : '#bae6fd';
+
+      // Dimension line to Left Edge (X coordinate)
+      drawCADDimensionBadge(
+        ctx,
+        0, obs.y,
+        obs.x, obs.y,
+        `X: ${obs.x.toFixed(1)}`,
+        {
+          color: lineColor,
+          borderColor: borderColor,
+          textColor: textColor,
+          fontSize: 8.0,
+          isDashed: true,
+          offsetBadgeY: -8
+        },
+        layoutMgr
+      );
+
+      // Dimension line to Top Edge (Y coordinate)
+      drawCADDimensionBadge(
+        ctx,
+        obs.x, 0,
+        obs.x, obs.y,
+        `Y: ${obs.y.toFixed(1)}`,
+        {
+          color: lineColor,
+          borderColor: borderColor,
+          textColor: textColor,
+          fontSize: 8.0,
+          isDashed: true,
+          offsetBadgeX: 10
+        },
+        layoutMgr
+      );
+
+      // If selected, also show distance to right edge
+      if (isSelected) {
+        const distRight = beltGreen.width - obs.x;
+        drawCADDimensionBadge(
+          ctx,
+          obs.x, obs.y + 6,
+          beltGreen.width, obs.y + 6,
+          `ขวา: ${distRight.toFixed(1)}`,
+          {
+            color: '#f59e0b',
+            borderColor: '#f59e0b',
+            textColor: '#fef3c7',
+            fontSize: 7.8,
+            isDashed: true
+          },
+          layoutMgr
+        );
+      }
+    }
+  }
+
+  // 4. Draw Callout Cards (Labels & Specs)
+  if (cadOpts.showLabels) {
+    for (let i = 0; i < state.config.obstacles.length; i++) {
+      const obs = state.config.obstacles[i];
+      const isSelected = (obs.id === state.selectedObsId);
+
+      if (cadOpts.focusSelected && !isSelected) continue;
+
+      drawObstacleCalloutCard(ctx, obs, i, isSelected, beltGreen.width, layoutMgr);
+    }
+  }
+
+  ctx.restore();
+}
+
+// Draw Obstacle (Tri / Rect / Circle)
+function drawObstacle(obs, isSelected, isCADMode, obsIndex) {
+  ctx.save();
+  ctx.translate(obs.x, obs.y);
+  ctx.rotate((obs.angle * Math.PI) / 180);
+
+  if (obs.type === 'circle') {
+    ctx.beginPath();
+    ctx.arc(0, 0, obs.radius, 0, Math.PI * 2);
+    ctx.fillStyle = isCADMode ? 'rgba(168, 85, 247, 0.2)' : '#a855f7';
+    ctx.fill();
+    ctx.strokeStyle = isSelected ? '#f59e0b' : '#c084fc';
+    ctx.lineWidth = isSelected ? 2.5 : 1.5;
+    ctx.stroke();
+  } else if (obs.type === 'rectangle') {
+    ctx.beginPath();
+    ctx.rect(-obs.width / 2, -obs.height / 2, obs.width, obs.height);
+    ctx.fillStyle = isCADMode ? 'rgba(234, 179, 8, 0.2)' : '#f59e0b';
+    ctx.fill();
+    ctx.strokeStyle = isSelected ? '#38bdf8' : '#fbbf24';
+    ctx.lineWidth = isSelected ? 2.5 : 1.5;
+    ctx.stroke();
+  } else if (obs.type === 'triangle') {
+    const h = obs.height;
+    const b = obs.width;
+    ctx.beginPath();
+    ctx.moveTo(0, -h * 0.6);
+    ctx.lineTo(-b / 2, h * 0.4);
+    ctx.lineTo(b / 2, h * 0.4);
+    ctx.closePath();
+    ctx.fillStyle = isCADMode ? 'rgba(56, 189, 248, 0.2)' : '#0284c7';
+    ctx.fill();
+    ctx.strokeStyle = isSelected ? '#f59e0b' : '#38bdf8';
+    ctx.lineWidth = isSelected ? 2.5 : 1.5;
+    ctx.stroke();
+  }
+
+  // Center crosshair & index badge in CAD mode
+  if (isCADMode) {
+    drawCrosshair(0, 0, 4);
+    const idx = (obsIndex !== undefined) ? obsIndex : (state.config.obstacles.findIndex(o => o.id === obs.id) + 1);
+    if (idx > 0) {
+      ctx.beginPath();
+      ctx.arc(0, 0, 7.5, 0, Math.PI * 2);
+      ctx.fillStyle = isSelected ? '#f59e0b' : '#0284c7';
+      ctx.fill();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 7.5px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(idx.toString(), 0, 0.5);
+    }
+  } else {
+    drawCrosshair(0, 0, 4);
+  }
+
+  // Selection handles & rotation knob
+  if (isSelected && !isCADMode) {
+    ctx.strokeStyle = '#38bdf8';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    const boundRadius = Math.max(obs.width || obs.radius * 2, obs.height || obs.radius * 2) / 2 + 5;
+    ctx.strokeRect(-boundRadius, -boundRadius, boundRadius * 2, boundRadius * 2);
+    ctx.setLineDash([]);
+
+    // Rotate handle knob
+    ctx.beginPath();
+    ctx.moveTo(0, -boundRadius);
+    ctx.lineTo(0, -boundRadius - 15);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(0, -boundRadius - 15, 4, 0, Math.PI * 2);
+    ctx.fillStyle = '#38bdf8';
+    ctx.fill();
+  }
+
+  ctx.restore();
+}
+
+// Draw Datum / Origin Marker
+function drawDatumMarker(x, y, label) {
+  ctx.save();
+  ctx.strokeStyle = '#ef4444';
+  ctx.lineWidth = 2;
+
+  // X arrow
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x + 20, y);
+  ctx.lineTo(x + 16, y - 3);
+  ctx.moveTo(x + 20, y);
+  ctx.lineTo(x + 16, y + 3);
+  ctx.stroke();
+
+  // Y arrow
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x, y + 20);
+  ctx.lineTo(x - 3, y + 16);
+  ctx.moveTo(x, y);
+  ctx.lineTo(x + 3, y + 16);
+  ctx.stroke();
+
+  ctx.fillStyle = '#ef4444';
+  ctx.font = 'bold 8px monospace';
+  ctx.fillText('+X', x + 24, y + 3);
+  ctx.fillText('+Y', x - 4, y + 28);
+  ctx.fillText(label, x - 5, y - 5);
+  ctx.restore();
+}
+
+// Draw CAD Dimension Line with Arrows and solid background pill
+function drawDimensionLine(x1, y1, x2, y2, text, textPos = 'top', color = '#94a3b8') {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = 1;
+
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+
+  const arrowSize = 3;
+  const angle = Math.atan2(y2 - y1, x2 - x1);
+
+  // Arrow 1
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x1 + Math.cos(angle + 0.5) * arrowSize, y1 + Math.sin(angle + 0.5) * arrowSize);
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x1 + Math.cos(angle - 0.5) * arrowSize, y1 + Math.sin(angle - 0.5) * arrowSize);
+  ctx.stroke();
+
+  // Arrow 2
+  ctx.beginPath();
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - Math.cos(angle + 0.5) * arrowSize, y2 - Math.sin(angle + 0.5) * arrowSize);
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - Math.cos(angle - 0.5) * arrowSize, y2 - Math.sin(angle - 0.5) * arrowSize);
+  ctx.stroke();
+
+  ctx.font = '8px monospace';
+  const textWidth = ctx.measureText(text).width;
+  const midX = (x1 + x2) / 2;
+  const midY = (y1 + y2) / 2;
+
+  let offsetDx = 0, offsetDy = -4;
+  if (textPos === 'bottom') offsetDy = 10;
+  if (textPos === 'left') { offsetDx = -16; offsetDy = 0; }
+  if (textPos === 'right') { offsetDx = 16; offsetDy = 0; }
+
+  const tx = midX + offsetDx;
+  const ty = midY + offsetDy;
+  const pw = textWidth + 8;
+  const ph = 12;
+
+  // Solid background pill so line never passes through text
+  ctx.fillStyle = '#0f172a';
+  ctx.strokeStyle = 'rgba(51, 65, 85, 0.8)';
+  ctx.lineWidth = 0.8;
+  drawRoundedRect(ctx, tx - pw / 2, ty - ph / 2, pw, ph, 2);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = color;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, tx, ty + 0.5);
+  ctx.restore();
+}
+
+// Draw center crosshair
+function drawCrosshair(x, y, r) {
+  ctx.beginPath();
+  ctx.moveTo(x - r, y);
+  ctx.lineTo(x + r, y);
+  ctx.moveTo(x, y - r);
+  ctx.lineTo(x, y + r);
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+}
+
+// Draw Conveyor Flow Direction Arrow
+function drawConveyorArrow(cx, cy, dirX, dirY, len, bgColor, arrowColor) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  const angle = Math.atan2(dirY, dirX);
+  ctx.rotate(angle);
+
+  ctx.fillStyle = arrowColor;
+  ctx.beginPath();
+  ctx.moveTo(-len / 2, -6);
+  ctx.lineTo(len / 4, -6);
+  ctx.lineTo(len / 4, -12);
+  ctx.lineTo(len / 2, 0);
+  ctx.lineTo(len / 4, 12);
+  ctx.lineTo(len / 4, 6);
+  ctx.lineTo(-len / 2, 6);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+// Draw Background Grid
+function drawGrid(step, color) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 0.5;
+
+  const startX = state.panX % (step * state.zoom);
+  const startY = state.panY % (step * state.zoom);
+  const stepPx = step * state.zoom;
+
+  ctx.beginPath();
+  for (let x = startX; x < canvas.width; x += stepPx) {
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, canvas.height);
+  }
+  for (let y = startY; y < canvas.height; y += stepPx) {
+    ctx.moveTo(0, y);
+    ctx.lineTo(canvas.width, y);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// -------------------------------------------------------------
+// User Interaction & Event Handlers
+// -------------------------------------------------------------
+
+function setupEventListeners() {
+  const container = document.getElementById('canvasWrapper');
+
+  container.addEventListener('mousedown', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    const world = canvasToWorld(cx, cy);
+
+    if (e.button === 1 || e.button === 2 || e.shiftKey) {
+      state.isPanning = true;
+      state.startPanX = cx - state.panX;
+      state.startPanY = cy - state.panY;
+      container.classList.add('grabbing');
+      return;
+    }
+
+    let hitObs = null;
+    let hitMode = 'move';
+
+    for (let i = state.config.obstacles.length - 1; i >= 0; i--) {
+      const obs = state.config.obstacles[i];
+      const dx = world.x - obs.x;
+      const dy = world.y - obs.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      if (obs.id === state.selectedObsId) {
+        const boundRadius = Math.max(obs.width || obs.radius * 2, obs.height || obs.radius * 2) / 2 + 5;
+        const rad = (-obs.angle * Math.PI) / 180;
+        const localX = Math.cos(rad) * dx - Math.sin(rad) * dy;
+        const localY = Math.sin(rad) * dx + Math.cos(rad) * dy;
+        const knobDist = Math.hypot(localX, localY - (-boundRadius - 15));
+        if (knobDist < 8) {
+          hitObs = obs;
+          hitMode = 'rotate';
+          break;
+        }
+      }
+
+      const hitRadius = Math.max(obs.width || obs.radius * 2, obs.height || obs.radius * 2) / 2;
+      if (dist <= hitRadius) {
+        hitObs = obs;
+        hitMode = 'move';
+        break;
+      }
+    }
+
+    if (hitObs) {
+      state.selectedObsId = hitObs.id;
+      state.dragTarget = {
+        id: hitObs.id,
+        mode: hitMode,
+        startX: world.x,
+        startY: world.y,
+        origX: hitObs.x,
+        origY: hitObs.y,
+        origAngle: hitObs.angle
+      };
+      updateObstacleListUI();
+    } else {
+      state.isPanning = true;
+      state.startPanX = cx - state.panX;
+      state.startPanY = cy - state.panY;
+      container.classList.add('grabbing');
+    }
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    const world = canvasToWorld(cx, cy);
+
+    if (state.isPanning) {
+      state.panX = cx - state.startPanX;
+      state.panY = cy - state.startPanY;
+      return;
+    }
+
+    if (state.dragTarget) {
+      const obs = state.config.obstacles.find(o => o.id === state.dragTarget.id);
+      if (!obs) return;
+
+      if (state.dragTarget.mode === 'move') {
+        const deltaX = world.x - state.dragTarget.startX;
+        const deltaY = world.y - state.dragTarget.startY;
+        obs.x = Math.max(5, Math.min(state.config.beltGreen.width - 5, state.dragTarget.origX + deltaX));
+        obs.y = Math.max(5, Math.min(state.config.beltGreen.length - 10, state.dragTarget.origY + deltaY));
+      } else if (state.dragTarget.mode === 'rotate') {
+        const currentAngle = Math.atan2(world.y - obs.y, world.x - obs.x) * (180 / Math.PI);
+        const startAngle = Math.atan2(state.dragTarget.startY - obs.y, state.dragTarget.startX - obs.x) * (180 / Math.PI);
+        obs.angle = Math.round(state.dragTarget.origAngle + (currentAngle - startAngle));
+      }
+
+      checkJammingRisks();
+      // Smoothly update input values without losing focus
+      const inpX = document.getElementById(`obs-x-${obs.id}`);
+      const inpY = document.getElementById(`obs-y-${obs.id}`);
+      const inpA = document.getElementById(`obs-a-${obs.id}`);
+      if (inpX) inpX.value = obs.x.toFixed(1);
+      if (inpY) inpY.value = obs.y.toFixed(1);
+      if (inpA) inpA.value = obs.angle;
+    }
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (state.dragTarget) {
+      updateObstacleListUI();
+      updateCadSpecsTable();
+    }
+    state.isPanning = false;
+    state.dragTarget = null;
+    container.classList.remove('grabbing');
+  });
+
+  container.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    const worldBefore = canvasToWorld(cx, cy);
+
+    const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
+    state.zoom = Math.max(0.3, Math.min(4.0, state.zoom * zoomFactor));
+
+    state.panX = cx - worldBefore.x * state.zoom;
+    state.panY = cy - worldBefore.y * state.zoom;
+  }, { passive: false });
+
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  bindUIControls();
+}
+
+// Bind UI form inputs
+function bindUIControls() {
+  document.getElementById('tabSimView').addEventListener('click', () => {
+    state.viewMode = 'sim';
+    document.getElementById('tabSimView').classList.add('active');
+    document.getElementById('tabCadView').classList.remove('active');
+    document.getElementById('blueprintSummaryCard').style.display = 'none';
+    const cadBar = document.getElementById('cadControlsBar');
+    if (cadBar) cadBar.style.display = 'none';
+  });
+  document.getElementById('tabCadView').addEventListener('click', () => {
+    state.viewMode = 'cad';
+    document.getElementById('tabCadView').classList.add('active');
+    document.getElementById('tabSimView').classList.remove('active');
+    document.getElementById('blueprintSummaryCard').style.display = 'block';
+    const cadBar = document.getElementById('cadControlsBar');
+    if (cadBar) cadBar.style.display = 'flex';
+    updateCadSpecsTable();
+  });
+
+  // CAD Layer Toggle Controls
+  const btnCoords = document.getElementById('btnToggleCadCoords');
+  if (btnCoords) {
+    btnCoords.addEventListener('click', () => {
+      state.cadOptions.showCoords = !state.cadOptions.showCoords;
+      btnCoords.classList.toggle('active', state.cadOptions.showCoords);
+    });
+  }
+
+  const btnDist = document.getElementById('btnToggleCadDist');
+  if (btnDist) {
+    btnDist.addEventListener('click', () => {
+      state.cadOptions.showDist = !state.cadOptions.showDist;
+      btnDist.classList.toggle('active', state.cadOptions.showDist);
+    });
+  }
+
+  const btnLabels = document.getElementById('btnToggleCadLabels');
+  if (btnLabels) {
+    btnLabels.addEventListener('click', () => {
+      state.cadOptions.showLabels = !state.cadOptions.showLabels;
+      btnLabels.classList.toggle('active', state.cadOptions.showLabels);
+    });
+  }
+
+  const btnFocus = document.getElementById('btnToggleCadFocus');
+  if (btnFocus) {
+    btnFocus.addEventListener('click', () => {
+      state.cadOptions.focusSelected = !state.cadOptions.focusSelected;
+      btnFocus.classList.toggle('focus-active', state.cadOptions.focusSelected);
+    });
+  }
+
+  const btnPlay = document.getElementById('btnPlay');
+  btnPlay.addEventListener('click', () => {
+    state.sim.running = !state.sim.running;
+    btnPlay.innerHTML = state.sim.running ? '⏸️ หยุด (Pause)' : '▶️ เล่น (Resume)';
+    btnPlay.className = state.sim.running ? 'btn btn-pause' : 'btn btn-primary';
+  });
+
+  document.getElementById('btnReset').addEventListener('click', resetStats);
+
+  document.querySelectorAll('.speed-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.speed-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      state.sim.speedMultiplier = parseFloat(btn.dataset.speed);
+    });
+  });
+
+  document.getElementById('btnBatch').addEventListener('click', () => {
+    runBatchSimulation(1000);
+  });
+
+  document.getElementById('btnCenter').addEventListener('click', autoCenterView);
+  document.getElementById('btnDownloadImg').addEventListener('click', downloadCanvasImage);
+
+  document.querySelectorAll('.panel-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.panel-tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+      tab.classList.add('active');
+      document.getElementById(tab.dataset.target).classList.add('active');
+    });
+  });
+
+  bindNumericInput('inpBlueWidth', v => state.config.beltBlue.width = v);
+  bindNumericInput('inpBlueLength', v => state.config.beltBlue.length = v);
+  bindNumericInput('inpBlueSpeed', v => state.config.beltBlue.speed = v);
+  bindNumericInput('inpBlueFeedRate', v => state.config.beltBlue.feedRate = v);
+  bindNumericInput('inpBlueOverlap', v => state.config.beltBlue.overlapX = v);
+
+  bindNumericInput('inpGreenWidth', v => {
+    state.config.beltGreen.width = v;
+    equalizeLanes();
+  });
+  bindNumericInput('inpGreenLength', v => state.config.beltGreen.length = v);
+  bindNumericInput('inpGreenSpeed', v => state.config.beltGreen.speed = v);
+
+  bindNumericInput('inpChickDiam', v => {
+    state.config.chick.diameter = v;
+    checkJammingRisks();
+  });
+
+  bindNumericInput('inpLaneLength', v => state.config.lanes.length = v);
+  bindNumericInput('inpWedgeBase', v => state.config.lanes.wedgeBase = v);
+  bindNumericInput('inpWedgeHeight', v => state.config.lanes.wedgeHeight = v);
+  bindNumericInput('inpMinGapMul', v => {
+    state.config.lanes.minGapMultiplier = v;
+    checkJammingRisks();
+  });
+
+  document.getElementById('btnEqualizeLanes').addEventListener('click', equalizeLanes);
+
+  for (let i = 1; i <= 6; i++) {
+    const el = document.getElementById(`inpLaneW${i}`);
+    if (el) {
+      el.addEventListener('input', (e) => {
+        const val = parseFloat(e.target.value) || 10;
+        state.config.lanes.widths[i - 1] = val;
+        updateLaneTotalCheck();
+        updateCadSpecsTable();
+      });
+    }
+  }
+
+  document.getElementById('btnAddTri').addEventListener('click', () => addObstacle('triangle'));
+  document.getElementById('btnAddRect').addEventListener('click', () => addObstacle('rectangle'));
+  document.getElementById('btnAddCircle').addEventListener('click', () => addObstacle('circle'));
+
+  document.getElementById('presetSelect').addEventListener('change', (e) => {
+    loadPreset(e.target.value);
+  });
+
+  // Database Controls
+  const btnSaveDb = document.getElementById('btnSaveToDb');
+  if (btnSaveDb) btnSaveDb.addEventListener('click', saveCurrentDesignToDb);
+
+  const btnExp = document.getElementById('btnExportDbJson');
+  if (btnExp) btnExp.addEventListener('click', () => DB.exportJSON());
+
+  const inpDbFile = document.getElementById('inpDbFileInput');
+  const btnImp = document.getElementById('btnImportDbJson');
+  if (btnImp && inpDbFile) {
+    btnImp.addEventListener('click', () => inpDbFile.click());
+    inpDbFile.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (evt) => {
+        if (DB.importJSON(evt.target.result)) {
+          renderDbRecordsList();
+          alert('นำเข้าข้อมูลสำเร็จเรียบร้อยแล้วครับ!');
+        } else {
+          alert('ไฟล์ JSON ไม่ถูกต้อง');
+        }
+      };
+      reader.readAsText(file);
+      inpDbFile.value = '';
+    });
+  }
+
+  // GitHub Cloud Sync Buttons
+  const btnGhPush = document.getElementById('btnGhSyncPush');
+  const btnGhPull = document.getElementById('btnGhSyncPull');
+  const ghStatus = document.getElementById('ghSyncStatus');
+  const inpGhToken = document.getElementById('inpGhToken');
+  const inpGhGistId = document.getElementById('inpGhGistId');
+
+  if (inpGhToken && localStorage.getItem('GH_SYNC_TOKEN')) {
+    inpGhToken.value = localStorage.getItem('GH_SYNC_TOKEN');
+  }
+  if (inpGhGistId && localStorage.getItem('GH_SYNC_GIST_ID')) {
+    inpGhGistId.value = localStorage.getItem('GH_SYNC_GIST_ID');
+  }
+
+  if (btnGhPush) {
+    btnGhPush.addEventListener('click', async () => {
+      const token = inpGhToken.value.trim();
+      if (!token) {
+        alert('กรุณากรอก GitHub Token (PAT) ก่อนครับ');
+        return;
+      }
+      localStorage.setItem('GH_SYNC_TOKEN', token);
+      const gistId = inpGhGistId.value.trim() || null;
+
+      ghStatus.style.display = 'block';
+      ghStatus.innerHTML = '⏳ กำลังซิงค์ขึ้น GitHub...';
+      try {
+        const newGistId = await DB.syncToGitHubGist(token, gistId);
+        inpGhGistId.value = newGistId;
+        localStorage.setItem('GH_SYNC_GIST_ID', newGistId);
+        ghStatus.innerHTML = `✅ ซิงค์ขึ้น GitHub สำเร็จ! (Gist ID: ${newGistId})`;
+        ghStatus.style.color = '#22c55e';
+      } catch (err) {
+        ghStatus.innerHTML = `❌ ซิงค์ไม่สำเร็จ: ${err.message}`;
+        ghStatus.style.color = '#ef4444';
+      }
+    });
+  }
+
+  if (btnGhPull) {
+    btnGhPull.addEventListener('click', async () => {
+      const token = inpGhToken.value.trim();
+      const gistId = inpGhGistId.value.trim();
+      if (!token || !gistId) {
+        alert('กรุณากรอกทั้ง GitHub Token และ Gist ID');
+        return;
+      }
+      ghStatus.style.display = 'block';
+      ghStatus.innerHTML = '⏳ กำลังดึงข้อมูลจาก GitHub...';
+      try {
+        await DB.loadFromGitHubGist(token, gistId);
+        renderDbRecordsList();
+        ghStatus.innerHTML = '✅ ดึงข้อมูลจาก GitHub สำเร็จ!';
+        ghStatus.style.color = '#22c55e';
+      } catch (err) {
+        ghStatus.innerHTML = `❌ ดึงข้อมูลไม่สำเร็จ: ${err.message}`;
+        ghStatus.style.color = '#ef4444';
+      }
+    });
+  }
+}
+
+function bindNumericInput(id, callback) {
+  const el = document.getElementById(id);
+  if (el) {
+    el.addEventListener('input', (e) => {
+      const val = parseFloat(e.target.value);
+      if (!isNaN(val)) {
+        callback(val);
+        checkJammingRisks();
+        updateCadSpecsTable();
+      }
+    });
+  }
+}
+
+// Equalize all 6 lanes
+function equalizeLanes() {
+  const w = state.config.beltGreen.width;
+  const each = +(w / 6).toFixed(1);
+  for (let i = 0; i < 6; i++) {
+    state.config.lanes.widths[i] = each;
+    const input = document.getElementById(`inpLaneW${i + 1}`);
+    if (input) input.value = each;
+  }
+  updateLaneTotalCheck();
+  updateCadSpecsTable();
+}
+
+// Update lane total width display
+function updateLaneTotalCheck() {
+  const sum = state.config.lanes.widths.reduce((a, b) => a + b, 0);
+  const target = state.config.beltGreen.width;
+  const label = document.getElementById('laneTotalCheck');
+  if (label) {
+    const diff = Math.abs(sum - target);
+    if (diff < 0.1) {
+      label.innerHTML = `รวม: ${sum.toFixed(1)} cm (พอดีหน้ากว้าง)`;
+      label.style.color = '#22c55e';
+    } else {
+      label.innerHTML = `รวม: ${sum.toFixed(1)} cm (ต่างจากหน้ากว้างสายพาน ${target} cm)`;
+      label.style.color = '#ef4444';
+    }
+  }
+}
+
+// Add new obstacle
+function addObstacle(type) {
+  const count = state.config.obstacles.length + 1;
+  const newObs = {
+    id: `obs-${Date.now()}`,
+    type: type,
+    name: `ตัวเกี่ย ${count}`,
+    x: state.config.beltGreen.width / 2,
+    y: 80,
+    angle: 0
+  };
+
+  if (type === 'circle') {
+    newObs.radius = 5.0;
+  } else if (type === 'rectangle') {
+    newObs.width = 50.0;
+    newObs.height = 4.0;
+    newObs.angle = 30;
+  } else if (type === 'triangle') {
+    newObs.width = 30.0;
+    newObs.height = 25.0;
+  }
+
+  state.config.obstacles.push(newObs);
+  state.selectedObsId = newObs.id;
+  updateObstacleListUI();
+  checkJammingRisks();
+  updateCadSpecsTable();
+}
+
+// Delete obstacle
+function deleteObstacle(id) {
+  state.config.obstacles = state.config.obstacles.filter(o => o.id !== id);
+  if (state.selectedObsId === id) state.selectedObsId = null;
+  updateObstacleListUI();
+  checkJammingRisks();
+  updateCadSpecsTable();
+}
+
+// Update Obstacle List UI in sidebar
+function updateObstacleListUI() {
+  const container = document.getElementById('obstacleList');
+  if (!container) return;
+
+  if (state.config.obstacles.length === 0) {
+    container.innerHTML = `<div style="text-align:center; padding: 20px; color:#64748b; font-size:0.8rem;">ยังไม่มีตัวเกี่ย/สิ่งกีดขวางบนสายพาน<br>กดปุ่มด้านบนเพื่อเพิ่มชิ้นงาน</div>`;
+    return;
+  }
+
+  let html = '';
+  state.config.obstacles.forEach((obs) => {
+    const isSel = (obs.id === state.selectedObsId);
+    const tagClass = obs.type === 'triangle' ? 'obs-tag-tri' : (obs.type === 'rectangle' ? 'obs-tag-rect' : 'obs-tag-circle');
+    const shapeLabel = obs.type === 'triangle' ? 'สามเหลี่ยม' : (obs.type === 'rectangle' ? 'สี่เหลี่ยม' : 'วงกลม');
+
+    html += `
+      <div class="obs-item ${isSel ? 'selected' : ''}" onclick="selectObstacle('${obs.id}')">
+        <div class="obs-header">
+          <span class="obs-tag ${tagClass}">${shapeLabel}</span>
+          <span style="font-size:0.8rem; font-weight:600; color:#e2e8f0;">${obs.name}</span>
+          <div class="obs-actions">
+            <button class="btn-icon btn-icon-del" onclick="event.stopPropagation(); deleteObstacle('${obs.id}')" title="ลบ">🗑️</button>
+          </div>
+        </div>
+        <div class="input-row" style="margin-bottom:6px;">
+          <div>
+            <span class="form-label">แกน X <span class="form-unit">(cm)</span></span>
+            <input id="obs-x-${obs.id}" type="number" step="0.5" class="input-field" value="${obs.x.toFixed(1)}" 
+              oninput="updateObsParam('${obs.id}', 'x', this.value)">
+          </div>
+          <div>
+            <span class="form-label">แกน Y <span class="form-unit">(cm)</span></span>
+            <input id="obs-y-${obs.id}" type="number" step="0.5" class="input-field" value="${obs.y.toFixed(1)}" 
+              oninput="updateObsParam('${obs.id}', 'y', this.value)">
+          </div>
+        </div>
+        <div class="input-row">
+          ${obs.type === 'circle' ? `
+            <div>
+              <span class="form-label">รัศมี R <span class="form-unit">(cm)</span></span>
+              <input type="number" step="0.5" class="input-field" value="${obs.radius}" 
+                oninput="updateObsParam('${obs.id}', 'radius', this.value)">
+            </div>
+          ` : `
+            <div>
+              <span class="form-label">กว้าง W <span class="form-unit">(cm)</span></span>
+              <input type="number" step="0.5" class="input-field" value="${obs.width}" 
+                oninput="updateObsParam('${obs.id}', 'width', this.value)">
+            </div>
+            <div>
+              <span class="form-label">สูง H <span class="form-unit">(cm)</span></span>
+              <input type="number" step="0.5" class="input-field" value="${obs.height}" 
+                oninput="updateObsParam('${obs.id}', 'height', this.value)">
+            </div>
+          `}
+          <div>
+            <span class="form-label">มุม <span class="form-unit">(องศา)</span></span>
+            <input id="obs-a-${obs.id}" type="number" step="5" class="input-field" value="${obs.angle}" 
+              oninput="updateObsParam('${obs.id}', 'angle', this.value)">
+          </div>
+        </div>
+      </div>
+    `;
+  });
+
+  container.innerHTML = html;
+}
+
+// Select obstacle globally
+window.selectObstacle = function(id) {
+  state.selectedObsId = id;
+  updateObstacleListUI();
+};
+
+// Update obstacle parameters from inputs
+window.updateObsParam = function(id, key, val) {
+  const obs = state.config.obstacles.find(o => o.id === id);
+  if (!obs) return;
+  const num = parseFloat(val);
+  if (!isNaN(num)) {
+    obs[key] = num;
+    checkJammingRisks();
+    updateCadSpecsTable();
+  }
+};
+
+window.deleteObstacle = deleteObstacle;
+
+// Update CAD Blueprint Specs Table
+function updateCadSpecsTable() {
+  const tbody = document.getElementById('cadSpecsTbody');
+  if (!tbody) return;
+
+  const bg = state.config.beltGreen;
+  const laneStartY = bg.length - state.config.lanes.length;
+
+  if (state.config.obstacles.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; color:#64748b; padding:12px;">ไม่มีสิ่งกีดขวาง</td></tr>`;
+    return;
+  }
+
+  let rows = '';
+  state.config.obstacles.forEach((obs, idx) => {
+    const distLeft = obs.x.toFixed(1);
+    const distRight = (bg.width - obs.x).toFixed(1);
+    const distToLanes = (laneStartY - obs.y).toFixed(1);
+
+    let dims = '';
+    if (obs.type === 'circle') dims = `R: ${obs.radius} cm`;
+    else if (obs.type === 'rectangle') dims = `${obs.width}x${obs.height} cm, ${obs.angle}°`;
+    else if (obs.type === 'triangle') dims = `ฐาน:${obs.width} สูง:${obs.height} cm, ${obs.angle}°`;
+
+    rows += `
+      <tr>
+        <td style="font-weight:600; color:#38bdf8;">${idx + 1}. ${obs.name}</td>
+        <td>${obs.type}</td>
+        <td>(${obs.x.toFixed(1)}, ${obs.y.toFixed(1)})</td>
+        <td>ซ้าย: ${distLeft} | ขวา: ${distRight}</td>
+        <td>${distToLanes} cm</td>
+        <td>${dims}</td>
+      </tr>
+    `;
+  });
+
+  tbody.innerHTML = rows;
+}
+
+// Update Statistics & Lanes Chart UI
+function updateStatsUI() {
+  const { totalSorted, laneCounts, cv, mean, sd } = state.sim.stats;
+
+  const cvValEl = document.getElementById('statCvVal');
+  const cvBadgeEl = document.getElementById('statCvBadge');
+  if (cvValEl) {
+    cvValEl.innerText = `${cv.toFixed(1)}%`;
+  }
+
+  if (cvBadgeEl) {
+    if (totalSorted < 10) {
+      cvBadgeEl.innerText = 'รอข้อมูล...';
+      cvBadgeEl.className = 'cv-badge cv-badge-moderate';
+    } else if (cv < 5.0) {
+      cvBadgeEl.innerText = '⭐ ยอดเยี่ยม (สม่ำเสมอสูง)';
+      cvBadgeEl.className = 'cv-badge cv-badge-excellent';
+      if (cvValEl) cvValEl.style.color = '#22c55e';
+    } else if (cv < 10.0) {
+      cvBadgeEl.innerText = '✓ ดี (ผ่านเกณฑ์มาตรฐาน)';
+      cvBadgeEl.className = 'cv-badge cv-badge-good';
+      if (cvValEl) cvValEl.style.color = '#38bdf8';
+    } else if (cv < 20.0) {
+      cvBadgeEl.innerText = '⚠️ พอใช้ (กระจายปานกลาง)';
+      cvBadgeEl.className = 'cv-badge cv-badge-moderate';
+      if (cvValEl) cvValEl.style.color = '#f59e0b';
+    } else {
+      cvBadgeEl.innerText = '❌ ไม่สม่ำเสมอ (ไก่กองฝั่งเดียว)';
+      cvBadgeEl.className = 'cv-badge cv-badge-poor';
+      if (cvValEl) cvValEl.style.color = '#ef4444';
+    }
+  }
+
+  const sortedEl = document.getElementById('statTotalSorted');
+  const meanEl = document.getElementById('statMean');
+  const sdEl = document.getElementById('statSd');
+  if (sortedEl) sortedEl.innerText = totalSorted.toLocaleString();
+  if (meanEl) meanEl.innerText = mean.toFixed(1);
+  if (sdEl) sdEl.innerText = sd.toFixed(1);
+
+  const targetPct = 100 / 6; // 16.67%
+  for (let i = 1; i <= 6; i++) {
+    const count = laneCounts[i - 1] || 0;
+    const pct = totalSorted > 0 ? (count / totalSorted) * 100 : 0;
+
+    const countEl = document.getElementById(`laneCount${i}`);
+    const pctEl = document.getElementById(`lanePct${i}`);
+    const barEl = document.getElementById(`laneBar${i}`);
+
+    if (countEl) countEl.innerText = `${count} ตัว`;
+    if (pctEl) pctEl.innerText = `${pct.toFixed(1)}%`;
+    if (barEl) {
+      barEl.style.width = `${Math.min(100, pct * 2.5)}%`;
+      const diff = Math.abs(pct - targetPct);
+      if (diff <= 3.0) {
+        barEl.style.background = 'linear-gradient(90deg, #16a34a, #22c55e)';
+      } else if (diff <= 7.0) {
+        barEl.style.background = 'linear-gradient(90deg, #0284c7, #38bdf8)';
+      } else {
+        barEl.style.background = 'linear-gradient(90deg, #dc2626, #ef4444)';
+      }
+    }
+  }
+}
+
+// Update Jamming Warning Toast & UI
+function updateJammingWarningsUI() {
+  const toast = document.getElementById('warningToast');
+  const textEl = document.getElementById('warningToastText');
+  if (!toast || !textEl) return;
+
+  if (state.jammingRisks.length > 0) {
+    const r = state.jammingRisks[0];
+    const req = (state.config.chick.diameter * state.config.lanes.minGapMultiplier).toFixed(1);
+    textEl.innerHTML = `⚠️ <strong>พบความเสี่ยงติดขัด!</strong> ${r.title}: ช่องว่างจริง <strong>${r.dist.toFixed(1)} cm</strong> (เกณฑ์ปลอดภัย ≥ ${req} cm)`;
+    toast.style.display = 'flex';
+  } else {
+    toast.style.display = 'none';
+  }
+}
+
+// Download CAD Drawing / Canvas Image
+function downloadCanvasImage() {
+  const link = document.createElement('a');
+  link.download = `Chick_Conveyor_Design_${state.viewMode.toUpperCase()}.png`;
+  link.href = canvas.toDataURL('image/png');
+  link.click();
+}
+
+// -------------------------------------------------------------
+// Database Manager (LocalStorage + JSON Export/Import + GitHub Gist Cloud Sync)
+// -------------------------------------------------------------
+const DB = {
+  KEY: 'CHICK_SIM_DATABASE_V1',
+
+  getAll() {
+    try {
+      const data = localStorage.getItem(this.KEY);
+      return data ? JSON.parse(data) : [];
+    } catch (e) {
+      console.error('Failed to load database:', e);
+      return [];
+    }
+  },
+
+  save(record) {
+    try {
+      const list = this.getAll();
+      record.id = record.id || `rec-${Date.now()}`;
+      record.createdAt = new Date().toLocaleString('th-TH');
+      list.unshift(record);
+      localStorage.setItem(this.KEY, JSON.stringify(list));
+      return true;
+    } catch (e) {
+      console.error('Failed to save to database:', e);
+      return false;
+    }
+  },
+
+  delete(id) {
+    try {
+      let list = this.getAll();
+      list = list.filter(r => r.id !== id);
+      localStorage.setItem(this.KEY, JSON.stringify(list));
+      return true;
+    } catch (e) {
+      console.error('Failed to delete from database:', e);
+      return false;
+    }
+  },
+
+  exportJSON() {
+    const list = this.getAll();
+    const blob = new Blob([JSON.stringify(list, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Chick_Conveyor_Database_${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  },
+
+  importJSON(jsonString) {
+    try {
+      const imported = JSON.parse(jsonString);
+      if (Array.isArray(imported)) {
+        const current = this.getAll();
+        const combined = [...imported, ...current];
+        const unique = Array.from(new Map(combined.map(item => [item.id, item])).values());
+        localStorage.setItem(this.KEY, JSON.stringify(unique));
+        return true;
+      }
+      return false;
+    } catch (e) {
+      console.error('Invalid JSON database:', e);
+      return false;
+    }
+  },
+
+  async syncToGitHubGist(token, gistId = null) {
+    const list = this.getAll();
+    const body = {
+      description: "Chick Flow Simulator Database - Saved Designs & CV Experiments",
+      public: false,
+      files: {
+        "chick_simulator_database.json": {
+          content: JSON.stringify(list, null, 2)
+        }
+      }
+    };
+
+    const url = gistId ? `https://api.github.com/gists/${gistId}` : `https://api.github.com/gists`;
+    const method = gistId ? 'PATCH' : 'POST';
+
+    const res = await fetch(url, {
+      method: method,
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/vnd.github+json'
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (!res.ok) {
+      throw new Error(`GitHub API Error: ${res.statusText}`);
+    }
+
+    const data = await res.json();
+    return data.id;
+  },
+
+  async loadFromGitHubGist(token, gistId) {
+    const res = await fetch(`https://api.github.com/gists/${gistId}`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Accept': 'application/vnd.github+json'
+      }
+    });
+
+    if (!res.ok) {
+      throw new Error(`GitHub API Error: ${res.statusText}`);
+    }
+
+    const data = await res.json();
+    const file = data.files["chick_simulator_database.json"];
+    if (file && file.content) {
+      this.importJSON(file.content);
+      return true;
+    }
+    return false;
+  }
+};
+
+function saveCurrentDesignToDb() {
+  const nameInput = document.getElementById('inpDbDesignName');
+  const notesInput = document.getElementById('inpDbDesignNotes');
+
+  const name = (nameInput && nameInput.value.trim()) || `ดีไซน์_${new Date().toLocaleTimeString('th-TH')}`;
+  const notes = (notesInput && notesInput.value.trim()) || '';
+
+  const record = {
+    name: name,
+    notes: notes,
+    cv: state.sim.stats.cv || 0,
+    obstaclesCount: state.config.obstacles.length,
+    config: JSON.parse(JSON.stringify(state.config))
+  };
+
+  if (DB.save(record)) {
+    if (nameInput) nameInput.value = '';
+    if (notesInput) notesInput.value = '';
+    renderDbRecordsList();
+    alert(`บันทึกดีไซน์ "${name}" ลงฐานข้อมูลเรียบร้อยแล้ว!`);
+  }
+}
+
+function loadDesignFromDb(id) {
+  const list = DB.getAll();
+  const record = list.find(r => r.id === id);
+  if (!record) return;
+
+  state.config = JSON.parse(JSON.stringify(record.config));
+  state.selectedObsId = null;
+
+  // Refresh input forms
+  const bb = state.config.beltBlue;
+  const bg = state.config.beltGreen;
+  const chick = state.config.chick;
+  const lanes = state.config.lanes;
+
+  const setVal = (elId, v) => { const el = document.getElementById(elId); if (el) el.value = v; };
+  setVal('inpBlueWidth', bb.width);
+  setVal('inpBlueLength', bb.length);
+  setVal('inpBlueSpeed', bb.speed);
+  setVal('inpBlueFeedRate', bb.feedRate);
+  setVal('inpBlueOverlap', bb.overlapX);
+
+  setVal('inpGreenWidth', bg.width);
+  setVal('inpGreenLength', bg.length);
+  setVal('inpGreenSpeed', bg.speed);
+
+  setVal('inpChickDiam', chick.diameter);
+  setVal('inpLaneLength', lanes.length);
+  setVal('inpWedgeBase', lanes.wedgeBase);
+  setVal('inpWedgeHeight', lanes.wedgeHeight);
+  setVal('inpMinGapMul', lanes.minGapMultiplier);
+
+  for (let i = 0; i < 6; i++) {
+    setVal(`inpLaneW${i + 1}`, lanes.widths[i]);
+  }
+
+  updateLaneTotalCheck();
+  updateObstacleListUI();
+  checkJammingRisks();
+  updateCadSpecsTable();
+  resetStats();
+  autoCenterView();
+
+  alert(`โหลดดีไซน์ "${record.name}" เรียบร้อยแล้ว!`);
+}
+
+function deleteDesignFromDb(id) {
+  if (confirm('คุณต้องการลบรายการนี้ออกจากฐานข้อมูลใช่หรือไม่?')) {
+    DB.delete(id);
+    renderDbRecordsList();
+  }
+}
+
+function renderDbRecordsList() {
+  const container = document.getElementById('dbRecordsList');
+  const countBadge = document.getElementById('dbRecordCount');
+  if (!container) return;
+
+  const list = DB.getAll();
+  if (countBadge) countBadge.innerText = `${list.length} รายการ`;
+
+  if (list.length === 0) {
+    container.innerHTML = `<div style="text-align:center; padding:16px; color:#64748b; font-size:0.75rem;">ยังไม่มีข้อมูลที่บันทึก<br>กรอกชื่อแล้วกดปุ่ม "บันทึกลงฐานข้อมูล" ด้านบน</div>`;
+    return;
+  }
+
+  let html = '';
+  list.forEach(item => {
+    const cvText = (item.cv !== undefined && item.cv !== null) ? `CV: ${item.cv.toFixed(1)}%` : 'CV: -';
+    html += `
+      <div class="db-item">
+        <div style="flex:1; margin-right:8px;">
+          <div class="db-item-title">${item.name}</div>
+          <div class="db-item-sub">
+            📅 ${item.createdAt} | 🧩 ตัวเกี่ย: ${item.obstaclesCount || (item.config && item.config.obstacles ? item.config.obstacles.length : 0)} ชิ้น | <strong>${cvText}</strong>
+            ${item.notes ? `<br>💬 ${item.notes}` : ''}
+          </div>
+        </div>
+        <div class="db-item-actions">
+          <button class="btn btn-blue" style="padding:3px 8px; font-size:0.7rem;" onclick="loadDesignFromDb('${item.id}')">📂 โหลด</button>
+          <button class="btn-icon btn-icon-del" onclick="deleteDesignFromDb('${item.id}')" title="ลบ">🗑️</button>
+        </div>
+      </div>
+    `;
+  });
+
+  container.innerHTML = html;
+}
+
+window.loadDesignFromDb = loadDesignFromDb;
+window.deleteDesignFromDb = deleteDesignFromDb;
+
+// Start on DOM ready
+document.addEventListener('DOMContentLoaded', initApp);
